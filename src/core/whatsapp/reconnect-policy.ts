@@ -78,13 +78,16 @@ export function classifyDisconnect(statusCode: number | undefined): DisconnectDe
     };
   }
 
+  // Another client opened this same session. Reconnecting would take it back and
+  // start a takeover loop between the two clients, so stop and keep the credentials.
   if (statusCode === DisconnectCode.connectionReplaced) {
     return {
-      recoverable: true,
+      recoverable: false,
       resetCredentials: false,
-      state: 'RECONNECTING',
+      state: 'DISCONNECTED',
       category: 'connection_replaced',
-      message: 'The WhatsApp connection was replaced.',
+      message:
+        'Another client opened this WhatsApp session. Automatic reconnection stopped. Stop the other client, then call POST /api/session/connect.',
     };
   }
 

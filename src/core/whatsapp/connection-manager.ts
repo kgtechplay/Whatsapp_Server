@@ -2,11 +2,12 @@ import type { AppConfig } from '../../config/env.js';
 import type { AppLogger } from '../../config/logger.js';
 import { AuthStoreError, OperationConflictError } from '../../shared/errors/app-error.js';
 import type { WhatsAppConnectionProvider } from '../interfaces/connection-provider.js';
-import { readDisconnectStatusCode, readSocketAccount } from './baileys-socket.js';
+import { describeDisconnect, readSocketAccount } from './baileys-socket.js';
 import type { ConnectionUpdateLike, SocketFactory, WaSocketLike } from './baileys-socket.js';
 import { ConnectionStatusService } from './connection-status.js';
 import { classifyDisconnect, computeReconnectDelay } from './reconnect-policy.js';
 import type { ReconnectPolicy } from './reconnect-policy.js';
+import { hasLinkedAccount } from './session-store.js';
 import type { AuthStateHandle, SessionStore } from './session-store.js';
 import type { ConnectResult, ConnectionStateName, ConnectionStatus, LogoutResult, QrQueryResult } from './whatsapp.types.js';
 
@@ -131,6 +132,7 @@ export class ConnectionManager implements WhatsAppConnectionProvider {
       }
 
       if (current === 'LOGGED_OUT' || this.credentialsNeedReset) {
+        await this.flushSaves();
         await this.options.sessionStore.invalidate();
         this.credentialsNeedReset = false;
         this.qr = null;
@@ -277,6 +279,7 @@ export class ConnectionManager implements WhatsAppConnectionProvider {
         this.safeEnd(socket);
       }
 
+      await this.flushSaves();
       await this.options.sessionStore.invalidate();
       this.registered = false;
       this.credentialsNeedReset = false;
@@ -377,9 +380,17 @@ export class ConnectionManager implements WhatsAppConnectionProvider {
     }
 
     const generation = ++this.generation;
+    const keys = handle.state.keys;
+    const trackedState = {
+      ...handle.state,
+      keys: {
+        get: keys.get.bind(keys),
+        set: (data: Parameters<typeof keys.set>[0]) => this.trackPending(keys.set(data)),
+      },
+    };
     let socket: WaSocketLike;
     try {
-      socket = await this.options.socketFactory.create(handle.state);
+      socket = await this.options.socketFactory.create(trackedState);
     } catch (error) {
       this.fail('socket', 'WhatsApp socket could not be created.', error);
       return;
@@ -392,7 +403,7 @@ export class ConnectionManager implements WhatsAppConnectionProvider {
 
     this.socket = socket;
     socket.ev.on('creds.update', () => {
-      this.registered = handle.state.creds?.registered === true || this.registered;
+      this.registered = hasLinkedAccount(handle.state.creds) || this.registered;
       this.trackSave(handle.saveCreds);
     });
     socket.ev.on('connection.update', (update) => {
@@ -424,6 +435,16 @@ export class ConnectionManager implements WhatsAppConnectionProvider {
           connectionState: 'QR_REQUIRED',
         },
         'Pairing QR generated',
+      );
+    }
+
+    if (update.isNewLogin) {
+      this.options.logger.info(
+        {
+          event: 'whatsapp.paired',
+          connectionState: this.options.status.snapshot().status,
+        },
+        'Pairing accepted by the phone',
       );
     }
 
@@ -465,57 +486,62 @@ export class ConnectionManager implements WhatsAppConnectionProvider {
     this.generation += 1;
     this.qr = null;
 
-    const decision = classifyDisconnect(readDisconnectStatusCode(error));
+    const disconnect = describeDisconnect(error);
+    const decision = classifyDisconnect(disconnect.statusCode ?? undefined);
+    const errorInfo = {
+      category: decision.category,
+      message: decision.message,
+      statusCode: disconnect.statusCode,
+      reason: disconnect.conflictType ?? disconnect.streamErrorTag ?? disconnect.failureReason ?? disconnect.reasonName,
+    };
     if (!decision.recoverable || !this.reconnectAllowed) {
       this.clearRetry();
       if (decision.resetCredentials) {
         this.credentialsNeedReset = true;
       }
       const state = decision.recoverable ? 'DISCONNECTED' : decision.state;
-      this.options.status.markDisconnected(
-        { category: decision.category, message: decision.message },
-        state === 'RECONNECTING' ? 'DISCONNECTED' : state,
-      );
+      const reconnectAttempt = this.options.status.snapshot().reconnectAttempts;
+      this.options.status.markDisconnected(errorInfo, state === 'RECONNECTING' ? 'DISCONNECTED' : state);
       const fields = {
-        event: decision.recoverable ? 'whatsapp.disconnected' : 'app.unrecoverable',
+        event: decision.recoverable || state !== 'ERROR' ? 'whatsapp.disconnected' : 'app.unrecoverable',
         connectionState: this.options.status.snapshot().status,
         errorCategory: decision.category,
-        reconnectAttempt: this.options.status.snapshot().reconnectAttempts,
+        reconnectAttempt,
+        disconnect,
         err: error,
       };
       if (decision.recoverable) {
         this.options.logger.warn(fields, 'WhatsApp disconnected');
       } else if (decision.state === 'LOGGED_OUT') {
-        this.options.logger.warn(
-          {
-            event: 'whatsapp.disconnected',
-            connectionState: 'LOGGED_OUT',
-            errorCategory: decision.category,
-            reconnectAttempt: 0,
-          },
-          'WhatsApp session logged out',
-        );
+        this.options.logger.warn(fields, 'WhatsApp session logged out');
+      } else if (decision.state === 'DISCONNECTED') {
+        this.options.logger.warn(fields, decision.message);
       } else {
         this.options.logger.error(fields, decision.message);
       }
       return;
     }
 
-    this.scheduleReconnect(decision.category, decision.message, error);
+    this.scheduleReconnect(errorInfo, disconnect, error);
   }
 
-  private scheduleReconnect(category: string, message: string, error: unknown): void {
+  private scheduleReconnect(
+    errorInfo: { category: string; message: string; statusCode: number | null; reason: string | null },
+    disconnect: ReturnType<typeof describeDisconnect>,
+    error: unknown,
+  ): void {
     this.clearRetry();
     const attempt = this.options.status.incrementReconnectAttempts();
     const delayMs = computeReconnectDelay(attempt, this.options.policy, this.random);
-    this.options.status.markDisconnected({ category, message }, 'RECONNECTING');
+    this.options.status.markDisconnected(errorInfo, 'RECONNECTING');
     this.options.logger.warn(
       {
         event: 'whatsapp.reconnect.scheduled',
         connectionState: 'RECONNECTING',
-        errorCategory: category,
+        errorCategory: errorInfo.category,
         reconnectAttempt: attempt,
         delayMs,
+        disconnect,
         err: error,
       },
       'Reconnection scheduled',
@@ -590,6 +616,22 @@ export class ConnectionManager implements WhatsAppConnectionProvider {
     });
   }
 
+  /**
+   * Signal key writes are awaited by Baileys, but shutdown must also wait for
+   * them so an exit cannot cut a pre-key or session file in half.
+   */
+  private trackPending(work: Promise<void>): Promise<void> {
+    const task = work.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.saves.add(task);
+    void task.finally(() => {
+      this.saves.delete(task);
+    });
+    return work;
+  }
+
   private async flushSaves(): Promise<void> {
     const pending = [...this.saves];
     if (pending.length === 0) {
@@ -606,9 +648,7 @@ export class ConnectionManager implements WhatsAppConnectionProvider {
   }
 
   private safeEnd(socket: WaSocketLike): void {
-    try {
-      socket.end(undefined);
-    } catch (error) {
+    const report = (error: unknown): void => {
       this.options.logger.warn(
         {
           event: 'whatsapp.disconnected',
@@ -618,6 +658,14 @@ export class ConnectionManager implements WhatsAppConnectionProvider {
         },
         'Socket close failed',
       );
+    };
+    try {
+      const closing = socket.end(undefined);
+      if (closing) {
+        closing.catch(report);
+      }
+    } catch (error) {
+      report(error);
     }
   }
 

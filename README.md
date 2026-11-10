@@ -10,13 +10,15 @@ Outbound sends use the Baileys socket already owned by `ConnectionManager`. Send
 |---|---|
 | Runtime | Node.js 22 or newer |
 | Language | TypeScript, strict mode |
-| WhatsApp | `@whiskeysockets/baileys` 6.7.24 |
+| WhatsApp | `@whiskeysockets/baileys` 7.0.0-rc14 |
 | HTTP | Express 4 |
 | Logs | Pino |
 | Tests | Vitest |
 | Deploy | Docker, Railway |
 
-Baileys 6.7.24 is the newest stable 6.x release checked for this project (published 2026-07-29). It requires Node.js 20 or newer. Baileys 7.0.0 is still a release candidate, so it is not used here. The 6.7.24 package depends on `libsignal` through a GitHub URL; `package-lock.json` pins that dependency for repeatable installs. Docker therefore needs `git` while installing dependencies.
+Baileys 7.0.0-rc14 (published 2026-07-29) is a release candidate. 7.0.0 final is not out yet, so the version is pinned exactly, without `^`. It requires Node.js 20 or newer. v7 includes the maintainers' fixes for random logouts, ghost sessions, and connection deadlocks. `libsignal` now installs from the npm registry, so the build no longer needs git.
+
+To go back to the last 6.x release, pin `"@whiskeysockets/baileys": "6.7.24"`, reinstall, and restore the auth folder from a backup taken before the upgrade. v7 writes extra key types (LID mappings and device lists) that 6.x does not expect.
 
 `useMultiFileAuthState` stores credentials and Signal keys as JSON files. Baileys documents that helper as unsuitable as a long-term production database. Phase 1 wraps it in `FileSessionStore` so a later version can replace the files without rewriting the connection manager or the HTTP API.
 
@@ -160,7 +162,13 @@ curl.exe -X POST -H "Authorization: Bearer $env:API_KEY" http://127.0.0.1:3000/a
 
 `CONNECTED` is set only after Baileys reports the socket open. Saved files alone do not mark the gateway connected.
 
-Recoverable disconnects retry with a 2 second initial delay, doubling until 60 seconds, with ±20% jitter, and never above the configured maximum. Logout, a bad session, and a multi-device mismatch stop automatic retries. `POST /api/session/connect` after logout or a rejected session deletes the local auth files and starts pairing again.
+Recoverable disconnects retry with a 2 second initial delay, doubling until 60 seconds, with ±20% jitter, and never above the configured maximum. Logout, a bad session, and a multi-device mismatch stop automatic retries. `POST /api/session/connect` after logout or a rejected session moves the local auth files into `.backups/<timestamp>` inside `WHATSAPP_AUTH_PATH` and starts pairing again. The newest 3 backups are kept.
+
+A `connectionReplaced` disconnect (440) means another client opened the same session, for example a second process using a copy of the auth folder. The gateway stops automatic retries and keeps the credentials, so the two clients do not keep taking the session from each other. Stop the other client, then call `POST /api/session/connect`.
+
+The gateway never calls WhatsApp logout on its own. Only `POST /api/session/logout` does. Shutdown and reconnects close the socket and keep the credentials.
+
+`lastError` in `/api/session/status` includes `statusCode` and `reason` from the last disconnect. For example `401` with `device_removed` means WhatsApp removed the linked device on its side.
 
 `AUTO_RECONNECT=false` still attempts one connection at startup. Later drops stay in `DISCONNECTED` until `POST /api/session/connect`.
 
@@ -317,6 +325,8 @@ Set `API_KEY` in the host's secret environment, not in the image.
 
 Logs are single-line JSON with `timestamp`, `level`, `event`, and `connectionState` when the event has one. Retry logs include `reconnectAttempt` and `errorCategory`.
 
+Every disconnect log has a `disconnect` object with `statusCode`, `reasonName`, `streamErrorCode`, `streamErrorTag`, `conflictType`, `failureReason`, and `failureLocation`. Message content and binary node data are not copied into it. At startup, `auth.storage` records the resolved auth path, the Railway volume mount path, `onVolume`, the hostname, process id, and Railway deployment and replica ids. On Railway, `auth.storage.ephemeral` is a warning that the auth path is not on a volume. `whatsapp.paired` marks the moment the phone accepted a QR scan.
+
 The process does not log the API key, QR payload, credential material, Signal keys, raw authorization headers, or message text. Phone numbers in send logs keep only the last four digits. Baileys' own logger is held at `warn` so a debug application level does not print connection payloads. `printQRInTerminal` is set to `false`.
 
 ## Docker
@@ -335,7 +345,7 @@ docker run --rm -p 3000:3000 `
   whatsapp-gateway
 ```
 
-The image listens on `0.0.0.0` and uses `PORT` when the platform sets it. It does not copy `.env` or auth files into the image. The build runs `npm ci` (git is required for the Baileys `libsignal` dependency) and then `npm run build`.
+The image listens on `0.0.0.0` and uses `PORT` when the platform sets it. It does not copy `.env` or auth files into the image. The build runs `npm ci` and then `npm run build`.
 
 A local Docker build was **not** run in the environment that produced this repository because the `docker` command was not installed there.
 
@@ -417,7 +427,7 @@ tests/                    Unit and HTTP tests with a fake socket
 - One WhatsApp account and one outbound coordinator per process. Do not run a second replica against the same auth volume.
 - Auth files are the Baileys multi-file helper, not a database. A crash while a file is half-written can force a new QR. Treat the volume as the session.
 - QR responses use `expiresAt: null`. Baileys does not include a reliable expiry on `connection.update`. The gateway replaces the stored payload when a new QR arrives.
-- The gateway does not fetch the latest WhatsApp Web version at startup. If WhatsApp rejects the version bundled in Baileys 6.7.24, bump that dependency and redeploy.
+- The gateway looks up the current WhatsApp Web version each time it connects. If the lookup fails, it uses the older version bundled with Baileys, which WhatsApp may reject.
 - `sent` means Baileys returned a message id. It does not mean WhatsApp delivered or displayed the message.
 - Idempotency and send quotas live in process memory. They reset on restart or deploy. A retry after a restart can send the message again.
 - A timed-out send is `unknown` and is not retried. New sends stay paused until that Baileys call finishes.

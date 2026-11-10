@@ -50,7 +50,7 @@ export class FakeSocket implements WaSocketLike {
       },
     });
   });
-  readonly end = vi.fn();
+  readonly end = vi.fn((_error?: Error): void | Promise<void> => undefined);
   sendMessage?: WaSocketLike['sendMessage'];
 
   readonly ev = {
@@ -89,6 +89,29 @@ export function emitClose(socket: FakeSocket, statusCode: number): void {
       error: disconnectError(statusCode),
       date: new Date(),
     },
+  });
+}
+
+/** Mirrors the Boom error Baileys raises from a `stream:error` node. */
+export function streamError(
+  code: string | undefined,
+  child: { tag: string; attrs?: Record<string, string>; content?: unknown },
+  statusCode: number,
+): Error & { output: { statusCode: number }; data: unknown } {
+  const error = new Error(`Stream Errored (${child.tag})`) as Error & { output: { statusCode: number }; data: unknown };
+  error.output = { statusCode };
+  error.data = {
+    tag: 'stream:error',
+    attrs: code === undefined ? {} : { code },
+    content: [{ tag: child.tag, attrs: child.attrs ?? {}, content: child.content }],
+  };
+  return error;
+}
+
+export function emitCloseWithError(socket: FakeSocket, error: unknown): void {
+  socket.emit('connection.update', {
+    connection: 'close',
+    lastDisconnect: { error, date: new Date() },
   });
 }
 

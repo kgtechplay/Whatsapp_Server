@@ -75,7 +75,7 @@ describe('session store', () => {
     expect(logger.text()).not.toContain('919876543210');
   });
 
-  it('invalidates every file in the auth directory', async () => {
+  it('clears every active file from the auth directory into a backup', async () => {
     const directory = await makeTempDir();
     await writeFile(path.join(directory, 'creds.json'), '{"registered":true}', 'utf8');
     await writeFile(path.join(directory, 'pre-key-1.json'), '{}', 'utf8');
@@ -85,7 +85,7 @@ describe('session store', () => {
     }));
 
     await store.invalidate();
-    expect(await readdir(directory)).toEqual([]);
+    expect(await readdir(directory)).toEqual(['.backups']);
   });
 
   it('keeps authentication paths out of git', async () => {

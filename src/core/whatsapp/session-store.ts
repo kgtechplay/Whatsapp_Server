@@ -1,4 +1,4 @@
-import { chmod, mkdir, readdir, readFile, rm } from 'node:fs/promises';
+import { chmod, mkdir, readdir, readFile, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 import type { AppLogger } from '../../config/logger.js';
 import { AuthStoreError } from '../../shared/errors/app-error.js';
@@ -29,6 +29,63 @@ export interface SessionStore {
   load(): Promise<AuthStateHandle>;
   invalidate(): Promise<void>;
 }
+
+/**
+ * Baileys sets `creds.registered` only for pairing-code logins. A QR-linked
+ * session keeps `registered: false` and is identified by `creds.me.id`.
+ */
+export function hasLinkedAccount(creds: StoredAuthState['creds']): boolean {
+  return creds?.registered === true || Boolean(creds?.me?.id);
+}
+
+export interface AuthStorageReport {
+  authPath: string;
+  onRailway: boolean;
+  volumeMountPath: string | null;
+  onVolume: boolean | null;
+  instance: {
+    hostname: string;
+    pid: number;
+    deploymentId: string | null;
+    replicaId: string | null;
+  };
+}
+
+/**
+ * Railway sets RAILWAY_VOLUME_MOUNT_PATH only when a volume is attached.
+ * Auth files outside that path are lost on every redeploy.
+ */
+export function describeAuthStorage(
+  env: NodeJS.ProcessEnv,
+  authPath: string,
+  host: { hostname: string; pid: number },
+): AuthStorageReport {
+  const resolved = path.resolve(authPath);
+  const onRailway = Boolean(env.RAILWAY_ENVIRONMENT_NAME || env.RAILWAY_ENVIRONMENT || env.RAILWAY_PROJECT_ID);
+  const mount = env.RAILWAY_VOLUME_MOUNT_PATH ? path.resolve(env.RAILWAY_VOLUME_MOUNT_PATH) : null;
+  let onVolume: boolean | null = null;
+  if (mount) {
+    const relative = path.relative(mount, resolved);
+    onVolume = relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+  } else if (onRailway) {
+    onVolume = false;
+  }
+  return {
+    authPath: resolved,
+    onRailway,
+    volumeMountPath: mount,
+    onVolume,
+    instance: {
+      hostname: host.hostname,
+      pid: host.pid,
+      deploymentId: env.RAILWAY_DEPLOYMENT_ID ?? null,
+      replicaId: env.RAILWAY_REPLICA_ID ?? null,
+    },
+  };
+}
+
+export const BACKUP_DIRECTORY = '.backups';
+export const MAX_AUTH_BACKUPS = 3;
 
 export type AuthStateFactory = (directory: string) => Promise<{
   state: StoredAuthState;
@@ -64,7 +121,7 @@ export class FileSessionStore implements SessionStore {
       throw new AuthStoreError(`Authentication storage could not be loaded from ${this.directory}: ${detail}`, 'unreadable');
     }
 
-    const registered = loaded.state.creds?.registered === true;
+    const registered = hasLinkedAccount(loaded.state.creds);
     return {
       state: loaded.state,
       saveCreds: async () => {
@@ -79,34 +136,89 @@ export class FileSessionStore implements SessionStore {
     };
   }
 
+  /**
+   * Moves the current auth files into `.backups/<timestamp>` inside the same
+   * directory, so the move stays on the same volume. Nothing is deleted except
+   * backups older than the newest MAX_AUTH_BACKUPS.
+   */
   async invalidate(): Promise<void> {
     await this.ensureDirectory();
-    let entries: string[];
-    try {
-      entries = await readdir(this.directory);
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : 'unknown error';
-      throw new AuthStoreError(`Authentication directory could not be read: ${detail}`, 'unreadable');
+    const entries = (await this.listEntries()).filter((entry) => entry !== BACKUP_DIRECTORY);
+    if (entries.length === 0) {
+      this.logger.info(
+        {
+          event: 'auth.invalidated',
+          connectionState: 'LOGGED_OUT',
+          backedUpFiles: 0,
+        },
+        'Authentication state invalidated',
+      );
+      return;
     }
 
-    await Promise.all(
-      entries.map(async (entry) => {
-        try {
-          await rm(path.join(this.directory, entry), { recursive: true, force: true });
-        } catch (error) {
-          const detail = error instanceof Error ? error.message : 'unknown error';
-          throw new AuthStoreError(`Authentication file ${entry} could not be removed: ${detail}`, 'write');
-        }
-      }),
-    );
+    const backupName = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupPath = path.join(this.directory, BACKUP_DIRECTORY, backupName);
+    try {
+      await mkdir(backupPath, { recursive: true, mode: 0o700 });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'unknown error';
+      throw new AuthStoreError(`Authentication backup directory could not be created: ${detail}`, 'write');
+    }
 
+    for (const entry of entries) {
+      try {
+        await rename(path.join(this.directory, entry), path.join(backupPath, entry));
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : 'unknown error';
+        throw new AuthStoreError(`Authentication file ${entry} could not be moved to the backup: ${detail}`, 'write');
+      }
+    }
+
+    await this.pruneBackups();
     this.logger.info(
       {
         event: 'auth.invalidated',
         connectionState: 'LOGGED_OUT',
+        backedUpFiles: entries.length,
+        backup: `${BACKUP_DIRECTORY}/${backupName}`,
       },
-      'Authentication state invalidated',
+      'Authentication state moved to a backup',
     );
+  }
+
+  private async listEntries(): Promise<string[]> {
+    try {
+      return await readdir(this.directory);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'unknown error';
+      throw new AuthStoreError(`Authentication directory could not be read: ${detail}`, 'unreadable');
+    }
+  }
+
+  private async pruneBackups(): Promise<void> {
+    const root = path.join(this.directory, BACKUP_DIRECTORY);
+    let backups: string[];
+    try {
+      backups = (await readdir(root)).sort();
+    } catch {
+      return;
+    }
+    const stale = backups.slice(0, Math.max(0, backups.length - MAX_AUTH_BACKUPS));
+    for (const name of stale) {
+      try {
+        await rm(path.join(root, name), { recursive: true, force: true });
+      } catch (error) {
+        this.logger.warn(
+          {
+            event: 'auth.backup.prune_failed',
+            connectionState: 'LOGGED_OUT',
+            errorCategory: 'auth_store',
+            err: error,
+          },
+          'An old authentication backup could not be removed',
+        );
+      }
+    }
   }
 
   private async ensureDirectory(): Promise<void> {

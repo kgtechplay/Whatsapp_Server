@@ -16,6 +16,8 @@ export type ConnectionStateName = (typeof CONNECTION_STATES)[number];
 export interface ConnectionErrorInfo {
   category: string;
   message: string;
+  statusCode?: number | null;
+  reason?: string | null;
 }
 
 export interface ConnectionStatus {

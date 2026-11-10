@@ -1,4 +1,5 @@
 import http from 'node:http';
+import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import dotenv from 'dotenv';
@@ -11,7 +12,7 @@ import { createBaileysSocketFactory } from './core/whatsapp/baileys-socket.js';
 import { ConnectionManager } from './core/whatsapp/connection-manager.js';
 import { ConnectionStatusService } from './core/whatsapp/connection-status.js';
 import { DEFAULT_JITTER_RATIO, DEFAULT_RECONNECT_MULTIPLIER } from './core/whatsapp/reconnect-policy.js';
-import { FileSessionStore } from './core/whatsapp/session-store.js';
+import { describeAuthStorage, FileSessionStore } from './core/whatsapp/session-store.js';
 import type { SessionStore } from './core/whatsapp/session-store.js';
 import type { SocketFactory } from './core/whatsapp/baileys-socket.js';
 
@@ -58,6 +59,28 @@ export async function startApplication(
     },
     'Configuration validated',
   );
+
+  const storage = describeAuthStorage(env, config.whatsappAuthPath, { hostname: os.hostname(), pid: process.pid });
+  if (storage.onRailway && storage.onVolume === false) {
+    logger.warn(
+      {
+        event: 'auth.storage.ephemeral',
+        connectionState: 'INITIALIZING',
+        errorCategory: 'auth_store',
+        ...storage,
+      },
+      'WHATSAPP_AUTH_PATH is not on a Railway volume. The WhatsApp session will be lost on redeploy.',
+    );
+  } else {
+    logger.info(
+      {
+        event: 'auth.storage',
+        connectionState: 'INITIALIZING',
+        ...storage,
+      },
+      'Authentication storage location',
+    );
+  }
 
   const status = new ConnectionStatusService();
   const sessionStore = overrides.sessionStore ?? new FileSessionStore(config.whatsappAuthPath, logger);
